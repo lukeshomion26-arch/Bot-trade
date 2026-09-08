@@ -4,64 +4,51 @@ import hmac
 import hashlib
 import requests
 
-BASE_URL = "https://api.crypto.com/exchange/v1"
-METHOD = "private/get-accounts"
+BASE = "https://api.crypto.com/exchange/v1"
 
 API_KEY = os.getenv("CRYPTO_API_KEY")
 API_SECRET = os.getenv("CRYPTO_API_SECRET")
 
-print("=== CRYPTO.COM AUTH TEST v4 ===", flush=True)
+print("=== CRYPTO.COM AUTH TEST v5 ===", flush=True)
 
-if not API_KEY:
-    raise RuntimeError("CRYPTO_API_KEY is missing")
+print("API KEY PRESENT:", bool(API_KEY), flush=True)
+print("SECRET PRESENT:", bool(API_SECRET), flush=True)
 
-if not API_SECRET:
-    raise RuntimeError("CRYPTO_API_SECRET is missing")
+# --------------------------------------------------
+# TEST 1: PUBLIC API
+# --------------------------------------------------
 
+print("", flush=True)
+print("=== TEST 1: PUBLIC API ===", flush=True)
 
-def object_to_string(obj):
-    if obj is None:
-        return ""
+try:
+    r = requests.get(
+        BASE + "/public/get-instruments",
+        timeout=20
+    )
 
-    result = ""
+    print("PUBLIC HTTP:", r.status_code, flush=True)
+    print("PUBLIC RESPONSE:", r.text[:500], flush=True)
 
-    for key in sorted(obj):
-        value = obj[key]
-
-        result += key
-
-        if isinstance(value, dict):
-            result += object_to_string(value)
-
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    result += object_to_string(item)
-                elif isinstance(item, list):
-                    result += str(item)
-                else:
-                    result += str(item)
-
-        else:
-            result += str(value)
-
-    return result
+except Exception as e:
+    print("PUBLIC ERROR:", type(e).__name__, str(e), flush=True)
 
 
-# Crypto.com requires a numeric request ID.
+# --------------------------------------------------
+# TEST 2: AUTHENTICATED API
+# --------------------------------------------------
+
+print("", flush=True)
+print("=== TEST 2: PRIVATE API ===", flush=True)
+
+METHOD = "private/get-accounts"
+PARAMS = {}
+
 request_id = int(time.time() * 1000)
-
-# Current Unix timestamp in milliseconds.
 nonce = int(time.time() * 1000)
 
-params = {}
+param_string = ""
 
-param_string = object_to_string(params)
-
-# Crypto.com's documented signature payload:
-#
-# method + id + api_key + parameter_string + nonce
-#
 signature_payload = (
     METHOD
     + str(request_id)
@@ -76,29 +63,26 @@ signature = hmac.new(
     hashlib.sha256
 ).hexdigest()
 
-
 body = {
     "id": request_id,
     "method": METHOD,
     "api_key": API_KEY,
-    "params": params,
+    "params": PARAMS,
     "nonce": nonce,
-    "sig": signature,
+    "sig": signature
 }
-
 
 print("METHOD:", METHOD, flush=True)
 print("REQUEST ID:", request_id, flush=True)
 print("NONCE:", nonce, flush=True)
-print("PARAM STRING:", repr(param_string), flush=True)
 print("API KEY LENGTH:", len(API_KEY), flush=True)
 print("SECRET LENGTH:", len(API_SECRET), flush=True)
 print("SIGNATURE LENGTH:", len(signature), flush=True)
-print("SENDING REQUEST...", flush=True)
+print("SENDING PRIVATE REQUEST...", flush=True)
 
 try:
-    response = requests.post(
-        BASE_URL + "/" + METHOD,
+    r = requests.post(
+        BASE + "/" + METHOD,
         json=body,
         headers={
             "Content-Type": "application/json"
@@ -106,34 +90,11 @@ try:
         timeout=20
     )
 
-    print("HTTP STATUS:", response.status_code, flush=True)
-    print("RESPONSE:", response.text[:2000], flush=True)
-
-    try:
-        data = response.json()
-
-        if data.get("code") == 0:
-            print("", flush=True)
-            print("================================", flush=True)
-            print("AUTHENTICATION SUCCESSFUL", flush=True)
-            print("GET-ACCOUNTS WORKS", flush=True)
-            print("================================", flush=True)
-        else:
-            print("", flush=True)
-            print("================================", flush=True)
-            print("AUTHENTICATION FAILED", flush=True)
-            print("================================", flush=True)
-
-    except Exception:
-        print("Response was not valid JSON.", flush=True)
+    print("PRIVATE HTTP:", r.status_code, flush=True)
+    print("PRIVATE RESPONSE:", r.text[:1000], flush=True)
 
 except Exception as e:
-    print(
-        "REQUEST ERROR:",
-        type(e).__name__,
-        str(e),
-        flush=True
-    )
+    print("PRIVATE ERROR:", type(e).__name__, str(e), flush=True)
 
 
 while True:
