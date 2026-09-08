@@ -4,50 +4,83 @@ import hmac
 import hashlib
 import requests
 
-BASE = "https://api.crypto.com/exchange/v1"
+BASE_URL = "https://api.crypto.com/exchange/v1"
 
 API_KEY = os.getenv("CRYPTO_API_KEY")
 API_SECRET = os.getenv("CRYPTO_API_SECRET")
 
-print("=== CRYPTO.COM AUTH TEST v5 ===", flush=True)
+METHOD = "private/user-balance"
 
-print("API KEY PRESENT:", bool(API_KEY), flush=True)
-print("SECRET PRESENT:", bool(API_SECRET), flush=True)
 
-# --------------------------------------------------
-# TEST 1: PUBLIC API
-# --------------------------------------------------
+print("=== CRYPTO.COM AUTH TEST v6 ===", flush=True)
 
-print("", flush=True)
-print("=== TEST 1: PUBLIC API ===", flush=True)
+if not API_KEY:
+    raise RuntimeError("CRYPTO_API_KEY is missing")
 
-try:
-    r = requests.get(
-        BASE + "/public/get-instruments",
-        timeout=20
-    )
-
-    print("PUBLIC HTTP:", r.status_code, flush=True)
-    print("PUBLIC RESPONSE:", r.text[:500], flush=True)
-
-except Exception as e:
-    print("PUBLIC ERROR:", type(e).__name__, str(e), flush=True)
+if not API_SECRET:
+    raise RuntimeError("CRYPTO_API_SECRET is missing")
 
 
 # --------------------------------------------------
-# TEST 2: AUTHENTICATED API
+# Crypto.com official parameter serializer
 # --------------------------------------------------
 
-print("", flush=True)
-print("=== TEST 2: PRIVATE API ===", flush=True)
+MAX_LEVEL = 3
 
-METHOD = "private/get-accounts"
-PARAMS = {}
 
-request_id = int(time.time() * 1000)
+def params_to_str(obj, level=0):
+    if level >= MAX_LEVEL:
+        return str(obj)
+
+    result = ""
+
+    for key in sorted(obj):
+        result += key
+
+        value = obj[key]
+
+        if value is None:
+            result += "null"
+
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    result += params_to_str(item, level + 1)
+                elif isinstance(item, list):
+                    result += params_to_str(item, level + 1)
+                else:
+                    result += str(item)
+
+        elif isinstance(value, dict):
+            result += params_to_str(value, level + 1)
+
+        else:
+            result += str(value)
+
+    return result
+
+
+# --------------------------------------------------
+# Build request
+# --------------------------------------------------
+
+# Keep ID independent from nonce.
+request_id = 11
+
+# One nonce, used in BOTH the signature and JSON body.
 nonce = int(time.time() * 1000)
 
-param_string = ""
+# Explicitly select the unified master Exchange account.
+params = {
+    "system_label": "ONEEX"
+}
+
+param_string = params_to_str(params)
+
+
+# EXACT Crypto.com formula:
+#
+# method + id + api_key + parameter_string + nonce
 
 signature_payload = (
     METHOD
@@ -57,32 +90,42 @@ signature_payload = (
     + str(nonce)
 )
 
+
 signature = hmac.new(
     API_SECRET.encode("utf-8"),
     signature_payload.encode("utf-8"),
     hashlib.sha256
 ).hexdigest()
 
+
 body = {
     "id": request_id,
     "method": METHOD,
     "api_key": API_KEY,
-    "params": PARAMS,
+    "params": params,
     "nonce": nonce,
     "sig": signature
 }
 
+
 print("METHOD:", METHOD, flush=True)
 print("REQUEST ID:", request_id, flush=True)
 print("NONCE:", nonce, flush=True)
+print("SYSTEM LABEL: ONEEX", flush=True)
+print("PARAM STRING:", param_string, flush=True)
 print("API KEY LENGTH:", len(API_KEY), flush=True)
 print("SECRET LENGTH:", len(API_SECRET), flush=True)
 print("SIGNATURE LENGTH:", len(signature), flush=True)
-print("SENDING PRIVATE REQUEST...", flush=True)
+print("SENDING...", flush=True)
+
+
+# --------------------------------------------------
+# Send
+# --------------------------------------------------
 
 try:
-    r = requests.post(
-        BASE + "/" + METHOD,
+    response = requests.post(
+        BASE_URL + "/" + METHOD,
         json=body,
         headers={
             "Content-Type": "application/json"
@@ -90,12 +133,35 @@ try:
         timeout=20
     )
 
-    print("PRIVATE HTTP:", r.status_code, flush=True)
-    print("PRIVATE RESPONSE:", r.text[:1000], flush=True)
+    print("HTTP STATUS:", response.status_code, flush=True)
+    print("RESPONSE:", response.text[:2000], flush=True)
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+
+    if data.get("code") == 0:
+        print("", flush=True)
+        print("======================================", flush=True)
+        print("AUTHENTICATION SUCCESSFUL", flush=True)
+        print("CRYPTO.COM ACCOUNT ACCESS WORKS", flush=True)
+        print("======================================", flush=True)
+    else:
+        print("", flush=True)
+        print("======================================", flush=True)
+        print("AUTHENTICATION FAILED", flush=True)
+        print("======================================", flush=True)
 
 except Exception as e:
-    print("PRIVATE ERROR:", type(e).__name__, str(e), flush=True)
+    print(
+        "REQUEST ERROR:",
+        type(e).__name__,
+        str(e),
+        flush=True
+    )
 
 
+# Keep Render worker alive.
 while True:
     time.sleep(30)
