@@ -4,12 +4,13 @@ import hmac
 import hashlib
 import requests
 
-BASE = "https://api.crypto.com/exchange/v1"
-
 API_KEY = os.getenv("CRYPTO_API_KEY")
 API_SECRET = os.getenv("CRYPTO_API_SECRET")
 
-print("=== CRYPTO AUTH TEST ===", flush=True)
+BASE_URL = "https://api.crypto.com/exchange/v1"
+METHOD = "private/user-balance"
+
+print("=== CRYPTO.COM AUTH TEST v2 ===", flush=True)
 
 if not API_KEY:
     raise RuntimeError("CRYPTO_API_KEY is missing")
@@ -17,21 +18,53 @@ if not API_KEY:
 if not API_SECRET:
     raise RuntimeError("CRYPTO_API_SECRET is missing")
 
-# Use a numeric request ID.
+
+# This follows Crypto.com's documented parameter-string algorithm.
+MAX_LEVEL = 3
+
+
+def params_to_str(obj, level=0):
+    if level >= MAX_LEVEL:
+        return str(obj)
+
+    result = ""
+
+    for key in sorted(obj):
+        result += key
+
+        value = obj[key]
+
+        if value is None:
+            result += "null"
+
+        elif isinstance(value, list):
+            for item in value:
+                result += params_to_str(item, level + 1)
+
+        elif isinstance(value, dict):
+            result += params_to_str(value, level + 1)
+
+        else:
+            result += str(value)
+
+    return result
+
+
+# Numeric request ID.
 request_id = int(time.time() * 1000)
 
-# Nonce must be current Unix time in milliseconds.
+# Current Unix timestamp in milliseconds.
 nonce = int(time.time() * 1000)
-
-method = "private/user-balance"
 
 params = {}
 
-# Empty because user-balance has no parameters.
-param_string = ""
+# Empty params means an empty parameter string.
+param_string = params_to_str(params, 0)
 
+# EXACT documented payload:
+# method + id + api_key + parameter_string + nonce
 payload = (
-    method
+    METHOD
     + str(request_id)
     + API_KEY
     + param_string
@@ -44,18 +77,20 @@ signature = hmac.new(
     hashlib.sha256
 ).hexdigest()
 
-print("METHOD:", method, flush=True)
+
+print("METHOD:", METHOD, flush=True)
 print("REQUEST ID:", request_id, flush=True)
 print("NONCE:", nonce, flush=True)
+print("PARAM STRING LENGTH:", len(param_string), flush=True)
 print("API KEY LENGTH:", len(API_KEY), flush=True)
 print("SECRET LENGTH:", len(API_SECRET), flush=True)
 print("SIGNATURE LENGTH:", len(signature), flush=True)
 
 body = {
     "id": request_id,
-    "method": method,
+    "method": METHOD,
     "api_key": API_KEY,
-    "params": {},
+    "params": params,
     "nonce": nonce,
     "sig": signature,
 }
@@ -64,7 +99,7 @@ print("SENDING REQUEST...", flush=True)
 
 try:
     response = requests.post(
-        BASE + "/" + method,
+        BASE_URL + "/" + METHOD,
         json=body,
         headers={
             "Content-Type": "application/json"
@@ -72,27 +107,37 @@ try:
         timeout=20,
     )
 
-    print("HTTP:", response.status_code, flush=True)
+    print("HTTP STATUS:", response.status_code, flush=True)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        print("RAW RESPONSE:", response.text[:500], flush=True)
+        raise
 
-    print("CODE:", data.get("code"), flush=True)
-    print("MESSAGE:", data.get("message"), flush=True)
+    print("API CODE:", data.get("code"), flush=True)
+
+    if data.get("message"):
+        print("API MESSAGE:", data.get("message"), flush=True)
 
     if data.get("code") == 0:
-        print("================================", flush=True)
+        print("", flush=True)
+        print("==============================", flush=True)
         print("AUTHENTICATION SUCCESSFUL", flush=True)
-        print("================================", flush=True)
+        print("==============================", flush=True)
+        print("ACCOUNT BALANCE REQUEST WORKS", flush=True)
     else:
+        print("", flush=True)
+        print("==============================", flush=True)
         print("AUTHENTICATION FAILED", flush=True)
+        print("==============================", flush=True)
 
 except Exception as e:
     print(
-        "ERROR:",
-        type(e).__name__,
-        str(e),
+        f"REQUEST ERROR: {type(e).__name__}: {e}",
         flush=True
     )
+
 
 while True:
     time.sleep(30)
