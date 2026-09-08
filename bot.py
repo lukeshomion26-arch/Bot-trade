@@ -2,8 +2,6 @@ import os
 import time
 import hmac
 import hashlib
-import json
-import uuid
 import requests
 
 CRYPTO_BASE = "https://api.crypto.com/exchange/v1"
@@ -16,19 +14,19 @@ print("API KEY:", "PRESENT" if API_KEY else "MISSING", flush=True)
 print("API SECRET:", "PRESENT" if API_SECRET else "MISSING", flush=True)
 
 
-def make_signature(method, params, nonce, req_id):
+def make_signature(method, request_id, params, nonce):
     params = params or {}
 
-    param_str = "".join(
-        f"{key}{params[key]}"
+    param_string = "".join(
+        key + str(params[key])
         for key in sorted(params)
     )
 
     payload = (
         method
-        + str(req_id)
+        + str(request_id)
         + API_KEY
-        + param_str
+        + param_string
         + str(nonce)
     )
 
@@ -40,13 +38,14 @@ def make_signature(method, params, nonce, req_id):
 
 
 def crypto_private(method, params=None):
-    req_id = str(uuid.uuid4())
-    nonce = int(time.time() * 1000)
-
     params = params or {}
 
+    # Crypto.com requires a numeric request ID.
+    request_id = int(time.time() * 1000)
+    nonce = int(time.time() * 1000)
+
     body = {
-        "id": req_id,
+        "id": request_id,
         "method": method,
         "api_key": API_KEY,
         "params": params,
@@ -55,9 +54,9 @@ def crypto_private(method, params=None):
 
     body["sig"] = make_signature(
         method,
+        request_id,
         params,
         nonce,
-        req_id
     )
 
     print(f"CALLING: {method}", flush=True)
@@ -65,17 +64,17 @@ def crypto_private(method, params=None):
     response = requests.post(
         f"{CRYPTO_BASE}/{method}",
         json=body,
-        timeout=20
+        timeout=20,
     )
 
     print("HTTP STATUS:", response.status_code, flush=True)
-    print("RESPONSE RECEIVED", flush=True)
 
     data = response.json()
 
-    # Don't print the entire response in case it contains
-    # information we don't need in the logs.
     print("API CODE:", data.get("code"), flush=True)
+
+    if data.get("message"):
+        print("API MESSAGE:", data["message"], flush=True)
 
     return data
 
@@ -83,20 +82,17 @@ def crypto_private(method, params=None):
 try:
     result = crypto_private("private/user-balance")
 
-    print("CRYPTO.COM CONNECTION TEST COMPLETE", flush=True)
-
-    result_data = result.get("result")
-
-    if result_data is not None:
-        print("ACCOUNT DATA RECEIVED: YES", flush=True)
+    if result.get("code") == 0:
+        print("========================================", flush=True)
+        print("CRYPTO.COM CONNECTION SUCCESSFUL", flush=True)
+        print("========================================", flush=True)
     else:
-        print("ACCOUNT DATA RECEIVED: NO", flush=True)
-        print("API MESSAGE:", result.get("message"), flush=True)
+        print("CRYPTO.COM REQUEST FAILED", flush=True)
 
 except Exception as e:
     print(
         f"CRYPTO TEST ERROR: {type(e).__name__}: {e}",
-        flush=True
+        flush=True,
     )
 
 while True:
