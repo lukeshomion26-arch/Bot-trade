@@ -1,52 +1,104 @@
 import os
 import time
+import hmac
+import hashlib
+import json
+import uuid
+import requests
 
-print("1. BOT STARTING", flush=True)
+CRYPTO_BASE = "https://api.crypto.com/exchange/v1"
+
+API_KEY = os.getenv("CRYPTO_API_KEY")
+API_SECRET = os.getenv("CRYPTO_API_SECRET")
+
+print("BOT STARTING", flush=True)
+print("API KEY:", "PRESENT" if API_KEY else "MISSING", flush=True)
+print("API SECRET:", "PRESENT" if API_SECRET else "MISSING", flush=True)
+
+
+def make_signature(method, params, nonce, req_id):
+    params = params or {}
+
+    param_str = "".join(
+        f"{key}{params[key]}"
+        for key in sorted(params)
+    )
+
+    payload = (
+        method
+        + str(req_id)
+        + API_KEY
+        + param_str
+        + str(nonce)
+    )
+
+    return hmac.new(
+        API_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def crypto_private(method, params=None):
+    req_id = str(uuid.uuid4())
+    nonce = int(time.time() * 1000)
+
+    params = params or {}
+
+    body = {
+        "id": req_id,
+        "method": method,
+        "api_key": API_KEY,
+        "params": params,
+        "nonce": nonce,
+    }
+
+    body["sig"] = make_signature(
+        method,
+        params,
+        nonce,
+        req_id
+    )
+
+    print(f"CALLING: {method}", flush=True)
+
+    response = requests.post(
+        f"{CRYPTO_BASE}/{method}",
+        json=body,
+        timeout=20
+    )
+
+    print("HTTP STATUS:", response.status_code, flush=True)
+    print("RESPONSE RECEIVED", flush=True)
+
+    data = response.json()
+
+    # Don't print the entire response in case it contains
+    # information we don't need in the logs.
+    print("API CODE:", data.get("code"), flush=True)
+
+    return data
+
 
 try:
-    import hmac
-    print("2. hmac OK", flush=True)
+    result = crypto_private("private/user-balance")
 
-    import hashlib
-    print("3. hashlib OK", flush=True)
+    print("CRYPTO.COM CONNECTION TEST COMPLETE", flush=True)
 
-    import json
-    print("4. json OK", flush=True)
+    result_data = result.get("result")
 
-    import uuid
-    print("5. uuid OK", flush=True)
-
-    from decimal import Decimal, ROUND_DOWN
-    print("6. decimal OK", flush=True)
-
-    from datetime import datetime, timezone
-    print("7. datetime OK", flush=True)
-
-    import requests
-    print("8. requests OK", flush=True)
+    if result_data is not None:
+        print("ACCOUNT DATA RECEIVED: YES", flush=True)
+    else:
+        print("ACCOUNT DATA RECEIVED: NO", flush=True)
+        print("API MESSAGE:", result.get("message"), flush=True)
 
 except Exception as e:
-    print(f"IMPORT ERROR: {type(e).__name__}: {e}", flush=True)
-    raise
-
-print("9. CHECKING ENVIRONMENT", flush=True)
-
-for name in [
-    "CRYPTO_API_KEY",
-    "CRYPTO_API_SECRET",
-    "GROK_API_KEY",
-]:
-    value = os.getenv(name)
-
-    if value:
-        print(f"{name}: PRESENT", flush=True)
-    else:
-        print(f"{name}: MISSING", flush=True)
-
-print("10. ENVIRONMENT CHECK COMPLETE", flush=True)
-
-print("11. BOT TEST COMPLETE", flush=True)
+    print(
+        f"CRYPTO TEST ERROR: {type(e).__name__}: {e}",
+        flush=True
+    )
 
 while True:
-    print("12. BOT ALIVE", flush=True)
+    print("BOT ALIVE", flush=True)
     time.sleep(30)
