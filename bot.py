@@ -5,6 +5,7 @@ import hashlib
 import json
 import uuid
 import requests
+
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 
@@ -27,55 +28,52 @@ ALLOWED_INSTRUMENTS = [
     "ETH_USDT"
 ]
 
+# 15 minutes between decisions
 LOOP_SECONDS = int(
     os.getenv("LOOP_SECONDS", "900")
 )
 
-MAX_POSITION_PCT = Decimal(
-    os.getenv("MAX_POSITION_PCT", "0.30")
-)
-
+# Grok must have at least this confidence
 MIN_CONFIDENCE = float(
     os.getenv("MIN_CONFIDENCE", "0.70")
 )
 
-DAILY_LOSS_LIMIT_PCT = Decimal(
-    os.getenv("DAILY_LOSS_LIMIT_PCT", "0.15")
-)
-
-# Maximum percentage of portfolio value that ONE trade
-# may represent.
+# Maximum portion of total portfolio used by one trade
 MAX_TRADE_PCT = Decimal(
-    os.getenv("MAX_TRADE_PCT", "0.30")
+    os.getenv("MAX_TRADE_PCT", "0.10")
 )
 
-# Prevent extremely small trades.
-MIN_TRADE_USDT = Decimal(
-    os.getenv("MIN_TRADE_USDT", "1.00")
+# Maximum percentage loss from the beginning of the UTC day
+DAILY_LOSS_LIMIT_PCT = Decimal(
+    os.getenv("DAILY_LOSS_LIMIT_PCT", "0.05")
 )
 
-# Maximum acceptable spread.
+# Ignore markets with excessive bid/ask spread
 MAX_SPREAD_PCT = Decimal(
     os.getenv("MAX_SPREAD_PCT", "0.50")
 )
 
-# Emergency switch.
-#
+# Don't bother attempting microscopic trades
+MIN_TRADE_USDT = Decimal(
+    os.getenv("MIN_TRADE_USDT", "1.00")
+)
+
+# Prevent repeatedly trading the same market too quickly
+TRADE_COOLDOWN_SECONDS = int(
+    os.getenv("TRADE_COOLDOWN_SECONDS", "1800")
+)
+
+# Order status polling
+ORDER_CHECK_SECONDS = 2
+ORDER_TIMEOUT_SECONDS = 30
+
 # IMPORTANT:
-# Set LIVE_TRADING=true only when you actually want
-# real orders.
+# false = NO REAL ORDERS
+# true  = REAL MONEY
 LIVE_TRADING = os.getenv(
     "LIVE_TRADING",
     "false"
 ).lower() == "true"
-
-# After sending an order, wait for the exchange to report
-# its state.
-ORDER_CHECK_SECONDS = 2
-
-# Never allow the bot to have an existing open order when
-# it is about to submit another one.
-REJECT_IF_OPEN_ORDERS = True
 
 ACCOUNT_STATE_FILE = os.getenv(
     "ACCOUNT_STATE_FILE",
@@ -103,14 +101,13 @@ if not GROK_API_KEY:
 
 def log(message):
     print(
-        f"[{datetime.now(timezone.utc).isoformat()}] "
-        f"{message}",
+        f"[{datetime.now(timezone.utc).isoformat()}] {message}",
         flush=True
     )
 
 
 # ============================================================
-# CRYPTO.COM SIGNATURE
+# GLOBAL REQUEST COUNTERS
 # ============================================================
 
 _request_id = 0
@@ -126,12 +123,6 @@ def next_request_id():
 
 
 def next_nonce():
-    """
-    Crypto.com requires a current millisecond nonce.
-
-    Also guarantees that two requests made in the same
-    millisecond don't reuse the same nonce.
-    """
     global _last_nonce
 
     nonce = int(time.time() * 1000)
@@ -144,17 +135,18 @@ def next_nonce():
     return nonce
 
 
+# ============================================================
+# CRYPTO.COM PARAMETER SERIALIZATION
+# ============================================================
+
 def params_to_string(obj, level=0):
     """
     Crypto.com HMAC parameter serialization.
-
-    Matches the API documentation's recursive
-    alphabetical-key serialization.
     """
 
-    MAX_LEVEL = 3
+    max_level = 3
 
-    if level >= MAX_LEVEL:
+    if level >= max_level:
         return str(obj)
 
     if obj is None:
@@ -204,9 +196,7 @@ def sign_request(
     nonce
 ):
 
-    param_string = params_to_string(
-        params
-    )
+    param_string = params_to_string(params)
 
     payload = (
         method
@@ -224,7 +214,7 @@ def sign_request(
 
 
 # ============================================================
-# CRYPTO.COM REST
+# CRYPTO.COM PUBLIC API
 # ============================================================
 
 def crypto_public(
@@ -237,7 +227,7 @@ def crypto_public(
     response = requests.get(
         url,
         params=params or {},
-        timeout=15
+        timeout=20
     )
 
     response.raise_for_status()
@@ -249,8 +239,12 @@ def crypto_public(
             f"Crypto.com public API error: {data}"
         )
 
-    return data["result"]
+    return data.get("result", {})
 
+
+# ============================================================
+# CRYPTO.COM PRIVATE API
+# ============================================================
 
 def crypto_private(
     method,
@@ -291,17 +285,15 @@ def crypto_private(
     data = response.json()
 
     if data.get("code") != 0:
-
         raise RuntimeError(
-            f"Crypto.com private API error: "
-            f"{data}"
+            f"Crypto.com private API error: {data}"
         )
 
-    return data["result"]
+    return data.get("result", {})
 
 
 # ============================================================
-# MARKET DATA
+# TICKER
 # ============================================================
 
 def get_ticker(instrument):
@@ -317,21 +309,25 @@ def get_ticker(instrument):
 
     if not data:
         raise RuntimeError(
-            f"No ticker for {instrument}"
+            f"No ticker returned for {instrument}"
         )
 
     ticker = data[0]
 
     return {
-        "price": Decimal(ticker["a"]),
-        "bid": Decimal(ticker["b"]),
-        "ask": Decimal(ticker["k"]),
-        "high": Decimal(ticker["h"]),
-        "low": Decimal(ticker["l"]),
-        "volume": Decimal(ticker["v"]),
-        "change_24h": Decimal(ticker["c"]) * 100
+        "price": Decimal(str(ticker["a"])),
+        "bid": Decimal(str(ticker["b"])),
+        "ask": Decimal(str(ticker["k"])),
+        "high": Decimal(str(ticker["h"])),
+        "low": Decimal(str(ticker["l"])),
+        "volume": Decimal(str(ticker["v"])),
+        "change_24h": Decimal(str(ticker["c"])) * 100
     }
 
+
+# ============================================================
+# CANDLE DATA
+# ============================================================
 
 def get_candles(
     instrument,
@@ -363,7 +359,7 @@ def get_candles(
 
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================================
 
 def sma(values, period):
@@ -371,9 +367,10 @@ def sma(values, period):
     if len(values) < period:
         return None
 
-    return sum(
-        values[-period:]
-    ) / Decimal(period)
+    return (
+        sum(values[-period:])
+        / Decimal(period)
+    )
 
 
 def rsi(values, period=14):
@@ -384,10 +381,9 @@ def rsi(values, period=14):
     gains = []
     losses = []
 
-    for i in range(
-        len(values) - period,
-        len(values)
-    ):
+    start = len(values) - period
+
+    for i in range(start, len(values)):
 
         change = (
             values[i]
@@ -397,7 +393,6 @@ def rsi(values, period=14):
         if change > 0:
             gains.append(change)
             losses.append(Decimal("0"))
-
         else:
             gains.append(Decimal("0"))
             losses.append(abs(change))
@@ -417,9 +412,12 @@ def rsi(values, period=14):
 
     rs = average_gain / average_loss
 
-    return Decimal("100") - (
+    return (
         Decimal("100")
-        / (Decimal("1") + rs)
+        - (
+            Decimal("100")
+            / (Decimal("1") + rs)
+        )
     )
 
 
@@ -435,22 +433,23 @@ def momentum(
     new = values[-1]
 
     return (
-        (new / old) - 1
-    ) * 100
+        ((new / old) - 1)
+        * 100
+    )
 
+
+# ============================================================
+# MARKET SNAPSHOT
+# ============================================================
 
 def market_snapshot(instrument):
 
-    ticker = get_ticker(
-        instrument
-    )
+    ticker = get_ticker(instrument)
 
-    candles = get_candles(
-        instrument
-    )
+    candles = get_candles(instrument)
 
     closes = [
-        Decimal(c["c"])
+        Decimal(str(c["c"]))
         for c in candles
     ]
 
@@ -461,32 +460,51 @@ def market_snapshot(instrument):
 
     return {
         "instrument": instrument,
+
         "price": str(ticker["price"]),
+
         "bid": str(ticker["bid"]),
+
         "ask": str(ticker["ask"]),
+
         "spread_pct": str(
             spread_pct.quantize(
                 Decimal("0.0001")
             )
         ),
+
         "24h_change_pct": str(
             ticker["change_24h"]
         ),
-        "24h_high": str(ticker["high"]),
-        "24h_low": str(ticker["low"]),
-        "24h_volume": str(ticker["volume"]),
+
+        "24h_high": str(
+            ticker["high"]
+        ),
+
+        "24h_low": str(
+            ticker["low"]
+        ),
+
+        "24h_volume": str(
+            ticker["volume"]
+        ),
+
         "sma_10": str(
             sma(closes, 10)
         ),
+
         "sma_20": str(
             sma(closes, 20)
         ),
+
         "sma_50": str(
             sma(closes, 50)
         ),
+
         "rsi_14": str(
             rsi(closes, 14)
         ),
+
         "momentum_10_candle_pct": str(
             momentum(closes, 10)
         )
@@ -494,7 +512,7 @@ def market_snapshot(instrument):
 
 
 # ============================================================
-# ACCOUNT
+# ACCOUNT BALANCES
 # ============================================================
 
 def get_balances():
@@ -514,24 +532,33 @@ def get_balances():
     return data[0]
 
 
+def position_balances(account):
+
+    return account.get(
+        "position_balances",
+        []
+    )
+
+
 def balance_for(
     account,
     currency
 ):
 
-    for item in account.get(
-        "position_balances",
-        []
-    ):
+    for item in position_balances(account):
 
-        if item.get(
+        instrument = item.get(
             "instrument_name"
-        ) == currency:
+        )
+
+        if instrument == currency:
 
             return Decimal(
-                item.get(
-                    "quantity",
-                    "0"
+                str(
+                    item.get(
+                        "quantity",
+                        "0"
+                    )
                 )
             )
 
@@ -543,24 +570,27 @@ def available_balance(
     currency
 ):
 
-    quantity = balance_for(
-        account,
-        currency
-    )
-
-    for item in account.get(
-        "position_balances",
-        []
-    ):
+    for item in position_balances(account):
 
         if item.get(
             "instrument_name"
         ) == currency:
 
+            quantity = Decimal(
+                str(
+                    item.get(
+                        "quantity",
+                        "0"
+                    )
+                )
+            )
+
             reserved = Decimal(
-                item.get(
-                    "reserved_qty",
-                    "0"
+                str(
+                    item.get(
+                        "reserved_qty",
+                        "0"
+                    )
                 )
             )
 
@@ -576,9 +606,7 @@ def available_balance(
 # INSTRUMENT INFORMATION
 # ============================================================
 
-def get_instrument_info(
-    instrument
-):
+def get_instrument_info(instrument):
 
     result = crypto_public(
         "public/get-instruments"
@@ -589,15 +617,14 @@ def get_instrument_info(
         []
     ):
 
-        if item.get(
-            "symbol"
-        ) == instrument:
+        symbol = item.get("symbol")
+
+        if symbol == instrument:
 
             if not item.get(
                 "tradable",
                 False
             ):
-
                 raise RuntimeError(
                     f"{instrument} is not tradable"
                 )
@@ -617,6 +644,9 @@ def round_quantity(
     tick = Decimal(
         str(tick_size)
     )
+
+    if tick <= 0:
+        return quantity
 
     return (
         quantity / tick
@@ -658,7 +688,10 @@ def get_open_orders(
 
     return result.get(
         "order_list",
-        result.get("data", [])
+        result.get(
+            "data",
+            []
+        )
     )
 
 
@@ -674,14 +707,17 @@ def get_order_detail(
     params = {}
 
     if order_id is not None:
+
         params["order_id"] = str(
             order_id
         )
 
     elif client_oid:
+
         params["client_oid"] = client_oid
 
     else:
+
         raise ValueError(
             "order_id or client_oid required"
         )
@@ -707,7 +743,7 @@ def get_order_detail(
 
 
 # ============================================================
-# ORDER EXECUTION
+# CREATE MARKET ORDER
 # ============================================================
 
 def create_market_order(
@@ -733,7 +769,7 @@ def create_market_order(
     }
 
     log(
-        f"LIVE ORDER -> "
+        f"ORDER REQUEST: "
         f"{side} {quantity} {instrument}"
     )
 
@@ -748,8 +784,7 @@ def create_market_order(
 
     if not order_id:
         raise RuntimeError(
-            f"Order created without order_id: "
-            f"{result}"
+            f"No order_id returned: {result}"
         )
 
     return {
@@ -758,14 +793,17 @@ def create_market_order(
     }
 
 
+# ============================================================
+# WAIT FOR ORDER
+# ============================================================
+
 def wait_for_order(
-    order_id,
-    client_oid
+    order_id
 ):
 
     deadline = (
         time.time()
-        + 30
+        + ORDER_TIMEOUT_SECONDS
     )
 
     last = None
@@ -787,19 +825,24 @@ def wait_for_order(
                     )
                 ).upper()
 
-                if status in [
+                log(
+                    f"ORDER STATUS: "
+                    f"{status}"
+                )
+
+                if status in (
                     "FILLED",
                     "REJECTED",
                     "CANCELED",
                     "EXPIRED"
-                ]:
+                ):
 
                     return last
 
         except Exception as e:
 
             log(
-                f"Order status check error: {e}"
+                f"Order status error: {e}"
             )
 
         time.sleep(
@@ -810,192 +853,85 @@ def wait_for_order(
 
 
 # ============================================================
-# GROK
+# PORTFOLIO VALUE
 # ============================================================
 
-def ask_grok(
-    market,
-    account_summary
-):
+def portfolio_value_usdt(account):
 
-    portfolio = {
-        "USDT": str(
-            available_balance(
-                account_summary,
-                "USDT"
-            )
-        ),
-        "BTC": str(
-            available_balance(
-                account_summary,
-                "BTC"
-            )
-        ),
-        "ETH": str(
-            available_balance(
-                account_summary,
-                "ETH"
-            )
+    usdt = available_balance(
+        account,
+        "USDT"
+    )
+
+    btc = available_balance(
+        account,
+        "BTC"
+    )
+
+    eth = available_balance(
+        account,
+        "ETH"
+    )
+
+    btc_value = Decimal("0")
+    eth_value = Decimal("0")
+
+    if btc > 0:
+
+        btc_ticker = get_ticker(
+            "BTC_USDT"
         )
-    }
 
-    prompt = f"""
-You are the decision-making component of a
-VERY SMALL SPOT cryptocurrency trading bot.
+        btc_value = (
+            btc
+            * btc_ticker["bid"]
+        )
 
-LIVE TRADING IS ENABLED.
+    if eth > 0:
 
-The Python risk engine, NOT you, controls the
-hard limits.
+        eth_ticker = get_ticker(
+            "ETH_USDT"
+        )
 
-Account balances:
-{json.dumps(portfolio, indent=2)}
+        eth_value = (
+            eth
+            * eth_ticker["bid"]
+        )
 
-Market data:
-{json.dumps(market, indent=2)}
-
-Allowed instruments:
-BTC_USDT
-ETH_USDT
-
-Trading rules:
-
-1. Spot only.
-2. No leverage.
-3. No short selling.
-4. HOLD is preferred when evidence is weak.
-5. Never invent market data.
-6. Consider SMA trend, RSI, momentum,
-   24-hour movement and spread.
-7. Do not recommend a trade merely because
-   the model must make a trade.
-8. A trade must have a clear reason.
-9. size_pct means the percentage of the
-   total portfolio that should be traded.
-10. Maximum size_pct is 0.30.
-
-Return ONLY this JSON:
-
-{{
-  "action": "buy" | "sell" | "hold",
-  "instrument": "BTC_USDT" | "ETH_USDT",
-  "confidence": 0.0,
-  "size_pct": 0.0,
-  "reason": "short explanation"
-}}
-"""
-
-    headers = {
-        "Authorization":
-            f"Bearer {GROK_API_KEY}",
-        "Content-Type":
-            "application/json"
-    }
-
-    payload = {
-        "model": GROK_MODEL,
-
-        "messages": [
-            {
-                "role": "system",
-                "content":
-                    "You are a conservative "
-                    "crypto trading analyst. "
-                    "Return valid JSON only."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-
-        "temperature": 0.1,
-
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name":
-                    "trading_decision",
-
-                "strict": True,
-
-                "schema": {
-                    "type": "object",
-
-                    "properties": {
-
-                        "action": {
-                            "type": "string",
-                            "enum": [
-                                "buy",
-                                "sell",
-                                "hold"
-                            ]
-                        },
-
-                        "instrument": {
-                            "type": "string",
-                            "enum": [
-                                "BTC_USDT",
-                                "ETH_USDT"
-                            ]
-                        },
-
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 1
-                        },
-
-                        "size_pct": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 0.30
-                        },
-
-                        "reason": {
-                            "type": "string"
-                        }
-                    },
-
-                    "required": [
-                        "action",
-                        "instrument",
-                        "confidence",
-                        "size_pct",
-                        "reason"
-                    ],
-
-                    "additionalProperties":
-                        False
-                }
-            }
-        }
-    }
-
-    response = requests.post(
-        GROK_URL,
-        headers=headers,
-        json=payload,
-        timeout=45
+    total = (
+        usdt
+        + btc_value
+        + eth_value
     )
 
-    response.raise_for_status()
-
-    result = response.json()
-
-    content = (
-        result["choices"][0]
-        ["message"]
-        ["content"]
-    )
-
-    return json.loads(content)
+    return total
 
 
 # ============================================================
 # STATE
 # ============================================================
+
+def default_state():
+
+    return {
+        "day":
+            datetime.now(
+                timezone.utc
+            ).date().isoformat(),
+
+        "day_start_value":
+            None,
+
+        "last_trade_time":
+            None,
+
+        "last_trade_instrument":
+            None,
+
+        "trades_today":
+            0
+    }
+
 
 def load_state():
 
@@ -1003,39 +939,44 @@ def load_state():
         ACCOUNT_STATE_FILE
     ):
 
-        return {
-            "day":
-                datetime.now(
-                    timezone.utc
-                ).date().isoformat(),
+        return default_state()
 
-            "day_start_value":
-                None,
+    try:
 
-            "last_trade_time":
-                None,
+        with open(
+            ACCOUNT_STATE_FILE,
+            "r"
+        ) as f:
 
-            "trades_today":
-                0
-        }
+            state = json.load(f)
 
-    with open(
-        ACCOUNT_STATE_FILE,
-        "r"
-    ) as f:
+        defaults = default_state()
 
-        return json.load(f)
+        for key, value in defaults.items():
+
+            if key not in state:
+                state[key] = value
+
+        return state
+
+    except Exception as e:
+
+        log(
+            f"Could not load state: {e}"
+        )
+
+        return default_state()
 
 
 def save_state(state):
 
-    tmp = (
+    temporary = (
         ACCOUNT_STATE_FILE
         + ".tmp"
     )
 
     with open(
-        tmp,
+        temporary,
         "w"
     ) as f:
 
@@ -1046,11 +987,117 @@ def save_state(state):
         )
 
     os.replace(
-        tmp,
+        temporary,
         ACCOUNT_STATE_FILE
     )
 
 
 # ============================================================
-# PORTFOLIO VALUE
-# ==========================================
+# DAILY LOSS PROTECTION
+# ============================================================
+
+def check_daily_loss(
+    state,
+    current_value
+):
+
+    today = (
+        datetime.now(
+            timezone.utc
+        )
+        .date()
+        .isoformat()
+    )
+
+    if state.get("day") != today:
+
+        state["day"] = today
+
+        state["day_start_value"] = str(
+            current_value
+        )
+
+        state["trades_today"] = 0
+
+        state["last_trade_time"] = None
+
+        state["last_trade_instrument"] = None
+
+        save_state(state)
+
+        log(
+            f"New UTC trading day. "
+            f"Starting value: "
+            f"${current_value:.4f}"
+        )
+
+        return True
+
+    if state.get(
+        "day_start_value"
+    ) is None:
+
+        state["day_start_value"] = str(
+            current_value
+        )
+
+        save_state(state)
+
+        log(
+            f"Daily starting value set: "
+            f"${current_value:.4f}"
+        )
+
+        return True
+
+    starting_value = Decimal(
+        str(
+            state[
+                "day_start_value"
+            ]
+        )
+    )
+
+    if starting_value <= 0:
+        return True
+
+    loss_pct = (
+        (starting_value - current_value)
+        / starting_value
+        * 100
+    )
+
+    log(
+        f"Daily P/L: "
+        f"{loss_pct:.2f}%"
+    )
+
+    max_loss_pct = (
+        DAILY_LOSS_LIMIT_PCT
+        * 100
+    )
+
+    if loss_pct >= max_loss_pct:
+
+        log(
+            "DAILY LOSS LIMIT REACHED. "
+            "NO NEW TRADES."
+        )
+
+        return False
+
+    return True
+
+
+# ============================================================
+# GROK DECISION
+# ============================================================
+
+def ask_grok(
+    market_data,
+    account
+):
+
+    portfolio = {
+        "USDT": str(
+            available_balanc
