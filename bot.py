@@ -4,97 +4,95 @@ import hmac
 import hashlib
 import requests
 
-CRYPTO_BASE = "https://api.crypto.com/exchange/v1"
+BASE = "https://api.crypto.com/exchange/v1"
 
 API_KEY = os.getenv("CRYPTO_API_KEY")
 API_SECRET = os.getenv("CRYPTO_API_SECRET")
 
-print("BOT STARTING", flush=True)
-print("API KEY:", "PRESENT" if API_KEY else "MISSING", flush=True)
-print("API SECRET:", "PRESENT" if API_SECRET else "MISSING", flush=True)
+print("=== CRYPTO AUTH TEST ===", flush=True)
 
+if not API_KEY:
+    raise RuntimeError("CRYPTO_API_KEY is missing")
 
-def make_signature(method, request_id, params, nonce):
-    params = params or {}
+if not API_SECRET:
+    raise RuntimeError("CRYPTO_API_SECRET is missing")
 
-    param_string = "".join(
-        key + str(params[key])
-        for key in sorted(params)
-    )
+# Use a numeric request ID.
+request_id = int(time.time() * 1000)
 
-    payload = (
-        method
-        + str(request_id)
-        + API_KEY
-        + param_string
-        + str(nonce)
-    )
+# Nonce must be current Unix time in milliseconds.
+nonce = int(time.time() * 1000)
 
-    return hmac.new(
-        API_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+method = "private/user-balance"
 
+params = {}
 
-def crypto_private(method, params=None):
-    params = params or {}
+# Empty because user-balance has no parameters.
+param_string = ""
 
-    # Crypto.com requires a numeric request ID.
-    request_id = int(time.time() * 1000)
-    nonce = int(time.time() * 1000)
+payload = (
+    method
+    + str(request_id)
+    + API_KEY
+    + param_string
+    + str(nonce)
+)
 
-    body = {
-        "id": request_id,
-        "method": method,
-        "api_key": API_KEY,
-        "params": params,
-        "nonce": nonce,
-    }
+signature = hmac.new(
+    API_SECRET.encode("utf-8"),
+    payload.encode("utf-8"),
+    hashlib.sha256
+).hexdigest()
 
-    body["sig"] = make_signature(
-        method,
-        request_id,
-        params,
-        nonce,
-    )
+print("METHOD:", method, flush=True)
+print("REQUEST ID:", request_id, flush=True)
+print("NONCE:", nonce, flush=True)
+print("API KEY LENGTH:", len(API_KEY), flush=True)
+print("SECRET LENGTH:", len(API_SECRET), flush=True)
+print("SIGNATURE LENGTH:", len(signature), flush=True)
 
-    print(f"CALLING: {method}", flush=True)
+body = {
+    "id": request_id,
+    "method": method,
+    "api_key": API_KEY,
+    "params": {},
+    "nonce": nonce,
+    "sig": signature,
+}
 
+print("SENDING REQUEST...", flush=True)
+
+try:
     response = requests.post(
-        f"{CRYPTO_BASE}/{method}",
+        BASE + "/" + method,
         json=body,
+        headers={
+            "Content-Type": "application/json"
+        },
         timeout=20,
     )
 
-    print("HTTP STATUS:", response.status_code, flush=True)
+    print("HTTP:", response.status_code, flush=True)
 
     data = response.json()
 
-    print("API CODE:", data.get("code"), flush=True)
+    print("CODE:", data.get("code"), flush=True)
+    print("MESSAGE:", data.get("message"), flush=True)
 
-    if data.get("message"):
-        print("API MESSAGE:", data["message"], flush=True)
-
-    return data
-
-
-try:
-    result = crypto_private("private/user-balance")
-
-    if result.get("code") == 0:
-        print("========================================", flush=True)
-        print("CRYPTO.COM CONNECTION SUCCESSFUL", flush=True)
-        print("========================================", flush=True)
+    if data.get("code") == 0:
+        print("================================", flush=True)
+        print("AUTHENTICATION SUCCESSFUL", flush=True)
+        print("================================", flush=True)
     else:
-        print("CRYPTO.COM REQUEST FAILED", flush=True)
+        print("AUTHENTICATION FAILED", flush=True)
 
 except Exception as e:
     print(
-        f"CRYPTO TEST ERROR: {type(e).__name__}: {e}",
-        flush=True,
+        "ERROR:",
+        type(e).__name__,
+        str(e),
+        flush=True
     )
 
 while True:
-    print("BOT ALIVE", flush=True)
     time.sleep(30)
