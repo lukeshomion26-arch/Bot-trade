@@ -4,149 +4,155 @@ import hmac
 import hashlib
 import json
 import uuid
-import requests
-
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
+
+import requests
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY")
-CRYPTO_API_SECRET = os.getenv("CRYPTO_API_SECRET")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
+CRYPTO_BASE = "https://api.crypto.com/exchange/v1"
+XAI_URL = "https://api.x.ai/v1/chat/completions"
 
-CRYPTO_BASE_URL = "https://api.crypto.com/exchange/v1"
-GROK_URL = "https://api.x.ai/v1/chat/completions"
+MODEL = os.getenv("GROK_MODEL", "grok-4.6")
 
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6")
-
-ALLOWED_INSTRUMENTS = [
+INSTRUMENTS = (
     "BTC_USDT",
-    "ETH_USDT"
-]
+    "ETH_USDT",
+)
 
-# 15 minutes between decisions
 LOOP_SECONDS = int(
     os.getenv("LOOP_SECONDS", "900")
 )
 
-# Grok must have at least this confidence
-MIN_CONFIDENCE = float(
-    os.getenv("MIN_CONFIDENCE", "0.70")
-)
-
-# Maximum portion of total portfolio used by one trade
 MAX_TRADE_PCT = Decimal(
     os.getenv("MAX_TRADE_PCT", "0.10")
 )
 
-# Maximum percentage loss from the beginning of the UTC day
+MIN_CONFIDENCE = float(
+    os.getenv("MIN_CONFIDENCE", "0.70")
+)
+
 DAILY_LOSS_LIMIT_PCT = Decimal(
     os.getenv("DAILY_LOSS_LIMIT_PCT", "0.05")
 )
 
-# Ignore markets with excessive bid/ask spread
 MAX_SPREAD_PCT = Decimal(
     os.getenv("MAX_SPREAD_PCT", "0.50")
 )
 
-# Don't bother attempting microscopic trades
 MIN_TRADE_USDT = Decimal(
     os.getenv("MIN_TRADE_USDT", "1.00")
 )
 
-# Prevent repeatedly trading the same market too quickly
-TRADE_COOLDOWN_SECONDS = int(
+COOLDOWN_SECONDS = int(
     os.getenv("TRADE_COOLDOWN_SECONDS", "1800")
 )
 
-# Order status polling
-ORDER_CHECK_SECONDS = 2
-ORDER_TIMEOUT_SECONDS = 30
-
 # IMPORTANT:
-# false = NO REAL ORDERS
-# true  = REAL MONEY
-LIVE_TRADING = os.getenv(
-    "LIVE_TRADING",
-    "false"
-).lower() == "true"
+# false = no real orders
+# true = real money
+LIVE_TRADING = (
+    os.getenv(
+        "LIVE_TRADING",
+        "false"
+    ).lower() == "true"
+)
 
-ACCOUNT_STATE_FILE = os.getenv(
+STATE_FILE = os.getenv(
     "ACCOUNT_STATE_FILE",
     "bot_state.json"
 )
 
 
 # ============================================================
-# VALIDATION
+# API KEYS
 # ============================================================
 
-if not CRYPTO_API_KEY:
-    raise ValueError("Missing CRYPTO_API_KEY")
+API_KEY = os.getenv(
+    "CRYPTO_API_KEY"
+)
 
-if not CRYPTO_API_SECRET:
-    raise ValueError("Missing CRYPTO_API_SECRET")
+API_SECRET = os.getenv(
+    "CRYPTO_API_SECRET"
+)
 
-if not GROK_API_KEY:
-    raise ValueError("Missing GROK_API_KEY")
+GROK_KEY = os.getenv(
+    "GROK_API_KEY"
+)
 
+if not API_KEY:
+    raise RuntimeError(
+        "Missing CRYPTO_API_KEY"
+    )
 
-# ============================================================
-# LOGGING
-# ============================================================
+if not API_SECRET:
+    raise RuntimeError(
+        "Missing CRYPTO_API_SECRET"
+    )
 
-def log(message):
-    print(
-        f"[{datetime.now(timezone.utc).isoformat()}] {message}",
-        flush=True
+if not GROK_KEY:
+    raise RuntimeError(
+        "Missing GROK_API_KEY"
     )
 
 
 # ============================================================
-# GLOBAL REQUEST COUNTERS
+# REQUEST COUNTERS
 # ============================================================
 
-_request_id = 0
-_last_nonce = 0
+REQUEST_ID = 0
+LAST_NONCE = 0
+
+
+def log(message):
+    print(
+        f"[{datetime.now(timezone.utc).isoformat()}] "
+        f"{message}",
+        flush=True
+    )
 
 
 def next_request_id():
-    global _request_id
+    global REQUEST_ID
 
-    _request_id += 1
+    REQUEST_ID += 1
 
-    return _request_id
+    return REQUEST_ID
 
 
 def next_nonce():
-    global _last_nonce
+    global LAST_NONCE
 
-    nonce = int(time.time() * 1000)
+    value = int(
+        time.time() * 1000
+    )
 
-    if nonce <= _last_nonce:
-        nonce = _last_nonce + 1
+    if value <= LAST_NONCE:
+        value = LAST_NONCE + 1
 
-    _last_nonce = nonce
+    LAST_NONCE = value
 
-    return nonce
+    return value
 
 
 # ============================================================
-# CRYPTO.COM PARAMETER SERIALIZATION
+# CRYPTO.COM SIGNATURE
 # ============================================================
 
-def params_to_string(obj, level=0):
+def serialize_params(
+    obj,
+    level=0
+):
     """
-    Crypto.com HMAC parameter serialization.
+    Crypto.com recursive parameter
+    serialization used for HMAC signing.
     """
 
-    max_level = 3
-
-    if level >= max_level:
+    if level >= 3:
         return str(obj)
 
     if obj is None:
@@ -156,30 +162,23 @@ def params_to_string(obj, level=0):
 
         output = ""
 
-        for key in sorted(obj.keys()):
+        for key in sorted(obj):
 
             output += str(key)
 
             value = obj[key]
 
-            if value is None:
-                output += "null"
-
-            elif isinstance(value, (dict, list)):
-                output += params_to_string(
-                    value,
-                    level + 1
-                )
-
-            else:
-                output += str(value)
+            output += serialize_params(
+                value,
+                level + 1
+            )
 
         return output
 
     if isinstance(obj, list):
 
         return "".join(
-            params_to_string(
+            serialize_params(
                 item,
                 level + 1
             )
@@ -189,95 +188,43 @@ def params_to_string(obj, level=0):
     return str(obj)
 
 
-def sign_request(
-    method,
-    request_id,
-    params,
-    nonce
-):
-
-    param_string = params_to_string(params)
-
-    payload = (
-        method
-        + str(request_id)
-        + CRYPTO_API_KEY
-        + param_string
-        + str(nonce)
-    )
-
-    return hmac.new(
-        CRYPTO_API_SECRET.encode("utf-8"),
-        payload.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-
-
-# ============================================================
-# CRYPTO.COM PUBLIC API
-# ============================================================
-
-def crypto_public(
-    method,
-    params=None
-):
-
-    url = f"{CRYPTO_BASE_URL}/{method}"
-
-    response = requests.get(
-        url,
-        params=params or {},
-        timeout=20
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != 0:
-        raise RuntimeError(
-            f"Crypto.com public API error: {data}"
-        )
-
-    return data.get("result", {})
-
-
-# ============================================================
-# CRYPTO.COM PRIVATE API
-# ============================================================
-
-def crypto_private(
+def private_call(
     method,
     params=None
 ):
 
     params = params or {}
 
-    request_id = next_request_id()
-    nonce = next_nonce()
+    rid = next_request_id()
+    n = next_nonce()
 
-    body = {
-        "id": request_id,
-        "method": method,
-        "api_key": CRYPTO_API_KEY,
-        "params": params,
-        "nonce": nonce
-    }
-
-    body["sig"] = sign_request(
-        method,
-        request_id,
-        params,
-        nonce
+    payload = (
+        method
+        + str(rid)
+        + API_KEY
+        + serialize_params(params)
+        + str(n)
     )
 
+    signature = hmac.new(
+        API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    body = {
+        "id": rid,
+        "method": method,
+        "api_key": API_KEY,
+        "params": params,
+        "nonce": n,
+        "sig": signature,
+    }
+
     response = requests.post(
-        f"{CRYPTO_BASE_URL}/{method}",
-        headers={
-            "Content-Type": "application/json"
-        },
+        f"{CRYPTO_BASE}/{method}",
         json=body,
-        timeout=20
+        timeout=20,
     )
 
     response.raise_for_status()
@@ -285,292 +232,78 @@ def crypto_private(
     data = response.json()
 
     if data.get("code") != 0:
+
         raise RuntimeError(
-            f"Crypto.com private API error: {data}"
+            f"Crypto.com {method}: {data}"
         )
 
-    return data.get("result", {})
-
-
-# ============================================================
-# TICKER
-# ============================================================
-
-def get_ticker(instrument):
-
-    result = crypto_public(
-        "public/get-tickers",
-        {
-            "instrument_name": instrument
-        }
+    return data.get(
+        "result",
+        {}
     )
 
-    data = result.get("data", [])
 
-    if not data:
-        raise RuntimeError(
-            f"No ticker returned for {instrument}"
-        )
-
-    ticker = data[0]
-
-    return {
-        "price": Decimal(str(ticker["a"])),
-        "bid": Decimal(str(ticker["b"])),
-        "ask": Decimal(str(ticker["k"])),
-        "high": Decimal(str(ticker["h"])),
-        "low": Decimal(str(ticker["l"])),
-        "volume": Decimal(str(ticker["v"])),
-        "change_24h": Decimal(str(ticker["c"])) * 100
-    }
-
-
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
-def get_candles(
-    instrument,
-    timeframe="15m",
-    count=100
+def public_call(
+    method,
+    params=None
 ):
 
-    result = crypto_public(
-        "public/get-candlestick",
-        {
-            "instrument_name": instrument,
-            "timeframe": timeframe,
-            "count": count
-        }
+    response = requests.get(
+        f"{CRYPTO_BASE}/{method}",
+        params=params or {},
+        timeout=20,
     )
 
-    candles = result.get("data", [])
+    response.raise_for_status()
 
-    if len(candles) < 50:
+    data = response.json()
+
+    if data.get("code") != 0:
+
         raise RuntimeError(
-            f"Not enough candles for {instrument}"
+            f"Crypto.com {method}: {data}"
         )
 
-    candles.sort(
-        key=lambda x: int(x["t"])
-    )
-
-    return candles
-
-
-# ============================================================
-# TECHNICAL INDICATORS
-# ============================================================
-
-def sma(values, period):
-
-    if len(values) < period:
-        return None
-
-    return (
-        sum(values[-period:])
-        / Decimal(period)
-    )
-
-
-def rsi(values, period=14):
-
-    if len(values) <= period:
-        return None
-
-    gains = []
-    losses = []
-
-    start = len(values) - period
-
-    for i in range(start, len(values)):
-
-        change = (
-            values[i]
-            - values[i - 1]
-        )
-
-        if change > 0:
-            gains.append(change)
-            losses.append(Decimal("0"))
-        else:
-            gains.append(Decimal("0"))
-            losses.append(abs(change))
-
-    average_gain = (
-        sum(gains)
-        / Decimal(period)
-    )
-
-    average_loss = (
-        sum(losses)
-        / Decimal(period)
-    )
-
-    if average_loss == 0:
-        return Decimal("100")
-
-    rs = average_gain / average_loss
-
-    return (
-        Decimal("100")
-        - (
-            Decimal("100")
-            / (Decimal("1") + rs)
-        )
-    )
-
-
-def momentum(
-    values,
-    period=10
-):
-
-    if len(values) <= period:
-        return None
-
-    old = values[-period - 1]
-    new = values[-1]
-
-    return (
-        ((new / old) - 1)
-        * 100
+    return data.get(
+        "result",
+        {}
     )
 
 
 # ============================================================
-# MARKET SNAPSHOT
-# ============================================================
-
-def market_snapshot(instrument):
-
-    ticker = get_ticker(instrument)
-
-    candles = get_candles(instrument)
-
-    closes = [
-        Decimal(str(c["c"]))
-        for c in candles
-    ]
-
-    spread_pct = (
-        (ticker["ask"] - ticker["bid"])
-        / ticker["bid"]
-    ) * 100
-
-    return {
-        "instrument": instrument,
-
-        "price": str(ticker["price"]),
-
-        "bid": str(ticker["bid"]),
-
-        "ask": str(ticker["ask"]),
-
-        "spread_pct": str(
-            spread_pct.quantize(
-                Decimal("0.0001")
-            )
-        ),
-
-        "24h_change_pct": str(
-            ticker["change_24h"]
-        ),
-
-        "24h_high": str(
-            ticker["high"]
-        ),
-
-        "24h_low": str(
-            ticker["low"]
-        ),
-
-        "24h_volume": str(
-            ticker["volume"]
-        ),
-
-        "sma_10": str(
-            sma(closes, 10)
-        ),
-
-        "sma_20": str(
-            sma(closes, 20)
-        ),
-
-        "sma_50": str(
-            sma(closes, 50)
-        ),
-
-        "rsi_14": str(
-            rsi(closes, 14)
-        ),
-
-        "momentum_10_candle_pct": str(
-            momentum(closes, 10)
-        )
-    }
-
-
-# ============================================================
-# ACCOUNT BALANCES
+# ACCOUNT
 # ============================================================
 
 def get_balances():
 
-    result = crypto_private(
+    result = private_call(
         "private/user-balance",
         {}
     )
 
-    data = result.get("data", [])
+    data = result.get(
+        "data",
+        []
+    )
 
     if not data:
+
         raise RuntimeError(
-            "No account balance returned"
+            "No balance data returned"
         )
 
     return data[0]
 
 
-def position_balances(account):
+def available(
+    account,
+    currency
+):
 
-    return account.get(
+    for item in account.get(
         "position_balances",
         []
-    )
-
-
-def balance_for(
-    account,
-    currency
-):
-
-    for item in position_balances(account):
-
-        instrument = item.get(
-            "instrument_name"
-        )
-
-        if instrument == currency:
-
-            return Decimal(
-                str(
-                    item.get(
-                        "quantity",
-                        "0"
-                    )
-                )
-            )
-
-    return Decimal("0")
-
-
-def available_balance(
-    account,
-    currency
-):
-
-    for item in position_balances(account):
+    ):
 
         if item.get(
             "instrument_name"
@@ -603,12 +336,543 @@ def available_balance(
 
 
 # ============================================================
-# INSTRUMENT INFORMATION
+# MARKET DATA
 # ============================================================
 
-def get_instrument_info(instrument):
+def get_ticker(symbol):
 
-    result = crypto_public(
+    result = public_call(
+        "public/get-tickers",
+        {
+            "instrument_name": symbol
+        }
+    )
+
+    data = result.get(
+        "data",
+        []
+    )
+
+    if not data:
+
+        raise RuntimeError(
+            f"No ticker for {symbol}"
+        )
+
+    item = data[0]
+
+    return {
+        "price": Decimal(
+            str(item["a"])
+        ),
+        "bid": Decimal(
+            str(item["b"])
+        ),
+        "ask": Decimal(
+            str(item["k"])
+        ),
+        "change": Decimal(
+            str(item["c"])
+        ) * 100,
+        "volume": Decimal(
+            str(item["v"])
+        ),
+    }
+
+
+def get_candles(symbol):
+
+    result = public_call(
+        "public/get-candlestick",
+        {
+            "instrument_name": symbol,
+            "timeframe": "15m",
+            "count": 100,
+        }
+    )
+
+    data = result.get(
+        "data",
+        []
+    )
+
+    if len(data) < 50:
+
+        raise RuntimeError(
+            f"Not enough candles for {symbol}"
+        )
+
+    return sorted(
+        data,
+        key=lambda x: int(x["t"])
+    )
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def sma(
+    values,
+    period
+):
+
+    if len(values) < period:
+        return None
+
+    return (
+        sum(values[-period:])
+        / Decimal(period)
+    )
+
+
+def rsi(
+    values,
+    period=14
+):
+
+    if len(values) <= period:
+        return None
+
+    gains = []
+    losses = []
+
+    start = len(values) - period
+
+    for i in range(
+        start,
+        len(values)
+    ):
+
+        change = (
+            values[i]
+            - values[i - 1]
+        )
+
+        gains.append(
+            max(
+                change,
+                Decimal("0")
+            )
+        )
+
+        losses.append(
+            max(
+                -change,
+                Decimal("0")
+            )
+        )
+
+    average_gain = (
+        sum(gains)
+        / Decimal(period)
+    )
+
+    average_loss = (
+        sum(losses)
+        / Decimal(period)
+    )
+
+    if average_loss == 0:
+        return Decimal("100")
+
+    rs = (
+        average_gain
+        / average_loss
+    )
+
+    return (
+        Decimal("100")
+        - (
+            Decimal("100")
+            / (Decimal("1") + rs)
+        )
+    )
+
+
+def market_snapshot(symbol):
+
+    ticker = get_ticker(
+        symbol
+    )
+
+    candles = get_candles(
+        symbol
+    )
+
+    closes = [
+        Decimal(str(c["c"]))
+        for c in candles
+    ]
+
+    spread = (
+        (
+            ticker["ask"]
+            - ticker["bid"]
+        )
+        / ticker["bid"]
+        * 100
+    )
+
+    momentum = (
+        (
+            closes[-1]
+            / closes[-11]
+        )
+        - 1
+    ) * 100
+
+    return {
+        "instrument": symbol,
+
+        "price": str(
+            ticker["price"]
+        ),
+
+        "bid": str(
+            ticker["bid"]
+        ),
+
+        "ask": str(
+            ticker["ask"]
+        ),
+
+        "spread_pct": str(
+            spread
+        ),
+
+        "change_24h_pct": str(
+            ticker["change"]
+        ),
+
+        "volume_24h": str(
+            ticker["volume"]
+        ),
+
+        "sma10": str(
+            sma(closes, 10)
+        ),
+
+        "sma20": str(
+            sma(closes, 20)
+        ),
+
+        "sma50": str(
+            sma(closes, 50)
+        ),
+
+        "rsi14": str(
+            rsi(closes, 14)
+        ),
+
+        "momentum10_pct": str(
+            momentum
+        ),
+    }
+
+
+# ============================================================
+# PORTFOLIO
+# ============================================================
+
+def portfolio_value(
+    account
+):
+
+    value = available(
+        account,
+        "USDT"
+    )
+
+    for coin, pair in (
+        ("BTC", "BTC_USDT"),
+        ("ETH", "ETH_USDT"),
+    ):
+
+        quantity = available(
+            account,
+            coin
+        )
+
+        if quantity:
+
+            value += (
+                quantity
+                * get_ticker(pair)["bid"]
+            )
+
+    return value
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def load_state():
+
+    if not os.path.exists(
+        STATE_FILE
+    ):
+
+        return {}
+
+    try:
+
+        with open(
+            STATE_FILE
+        ) as file:
+
+            return json.load(file)
+
+    except Exception:
+
+        return {}
+
+
+def save_state(
+    state
+):
+
+    temporary = (
+        STATE_FILE
+        + ".tmp"
+    )
+
+    with open(
+        temporary,
+        "w"
+    ) as file:
+
+        json.dump(
+            state,
+            file,
+            indent=2
+        )
+
+    os.replace(
+        temporary,
+        STATE_FILE
+    )
+
+
+def daily_loss_ok(
+    state,
+    current_value
+):
+
+    today = (
+        datetime.now(
+            timezone.utc
+        )
+        .date()
+        .isoformat()
+    )
+
+    if (
+        state.get("day")
+        != today
+        or not state.get(
+            "day_start_value"
+        )
+    ):
+
+        state["day"] = today
+
+        state["day_start_value"] = str(
+            current_value
+        )
+
+        state["trades_today"] = 0
+
+        save_state(state)
+
+        return True
+
+    starting_value = Decimal(
+        str(
+            state[
+                "day_start_value"
+            ]
+        )
+    )
+
+    if starting_value <= 0:
+        return True
+
+    loss = (
+        starting_value
+        - current_value
+    ) / starting_value
+
+    if loss >= DAILY_LOSS_LIMIT_PCT:
+
+        log(
+            f"DAILY LOSS LIMIT: "
+            f"{loss * 100:.2f}%"
+        )
+
+        return False
+
+    return True
+
+
+# ============================================================
+# GROK
+# ============================================================
+
+def ask_grok(
+    markets,
+    account
+):
+
+    balances = {
+        currency: str(
+            available(
+                account,
+                currency
+            )
+        )
+        for currency in (
+            "USDT",
+            "BTC",
+            "ETH",
+        )
+    }
+
+    prompt = (
+        "You are a conservative spot "
+        "cryptocurrency trading analyst. "
+        "Choose buy, sell, or hold using "
+        "ONLY the supplied data. "
+        "No leverage. No shorts. "
+        "HOLD when evidence is weak. "
+        "Maximum size_pct is 0.10.\n\n"
+        f"Balances:\n"
+        f"{json.dumps(balances)}\n\n"
+        f"Markets:\n"
+        f"{json.dumps(markets)}"
+    )
+
+    schema = {
+        "type": "object",
+
+        "properties": {
+
+            "action": {
+                "type": "string",
+                "enum": [
+                    "buy",
+                    "sell",
+                    "hold",
+                ],
+            },
+
+            "instrument": {
+                "type": "string",
+                "enum": list(
+                    INSTRUMENTS
+                ),
+            },
+
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+
+            "size_pct": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.10,
+            },
+
+            "reason": {
+                "type": "string",
+            },
+        },
+
+        "required": [
+            "action",
+            "instrument",
+            "confidence",
+            "size_pct",
+            "reason",
+        ],
+
+        "additionalProperties": False,
+    }
+
+    body = {
+        "model": MODEL,
+
+        "messages": [
+            {
+                "role": "system",
+                "content":
+                    "Return only valid JSON "
+                    "matching the schema.",
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+
+        "temperature": 0.1,
+
+        "response_format": {
+            "type": "json_schema",
+
+            "json_schema": {
+                "name":
+                    "trade_decision",
+
+                "strict":
+                    True,
+
+                "schema":
+                    schema,
+            },
+        },
+    }
+
+    response = requests.post(
+        XAI_URL,
+        headers={
+            "Authorization":
+                f"Bearer {GROK_KEY}",
+
+            "Content-Type":
+                "application/json",
+        },
+        json=body,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    content = (
+        result["choices"][0]
+        ["message"]
+        ["content"]
+    )
+
+    return json.loads(
+        content
+    )
+
+
+# ============================================================
+# EXCHANGE INFORMATION
+# ============================================================
+
+def instrument_info(
+    symbol
+):
+
+    result = public_call(
         "public/get-instruments"
     )
 
@@ -617,22 +881,23 @@ def get_instrument_info(instrument):
         []
     ):
 
-        symbol = item.get("symbol")
-
-        if symbol == instrument:
+        if item.get(
+            "symbol"
+        ) == symbol:
 
             if not item.get(
                 "tradable",
                 False
             ):
+
                 raise RuntimeError(
-                    f"{instrument} is not tradable"
+                    f"{symbol} is not tradable"
                 )
 
             return item
 
     raise RuntimeError(
-        f"Instrument not found: {instrument}"
+        f"Instrument not found: {symbol}"
     )
 
 
@@ -655,35 +920,21 @@ def round_quantity(
     ) * tick
 
 
-def decimal_string(value):
-
-    return format(
-        value,
-        "f"
-    )
-
-
 # ============================================================
 # OPEN ORDERS
 # ============================================================
 
-def get_open_orders(
-    instrument=None
+def open_orders(
+    symbol
 ):
 
-    params = {
-        "page_size": 200,
-        "page": 0
-    }
-
-    if instrument:
-        params[
-            "instrument_name"
-        ] = instrument
-
-    result = crypto_private(
+    result = private_call(
         "private/get-open-orders",
-        params
+        {
+            "instrument_name": symbol,
+            "page_size": 200,
+            "page": 0,
+        }
     )
 
     return result.get(
@@ -696,408 +947,232 @@ def get_open_orders(
 
 
 # ============================================================
-# ORDER DETAIL
-# ============================================================
-
-def get_order_detail(
-    order_id=None,
-    client_oid=None
-):
-
-    params = {}
-
-    if order_id is not None:
-
-        params["order_id"] = str(
-            order_id
-        )
-
-    elif client_oid:
-
-        params["client_oid"] = client_oid
-
-    else:
-
-        raise ValueError(
-            "order_id or client_oid required"
-        )
-
-    result = crypto_private(
-        "private/get-order-detail",
-        params
-    )
-
-    data = result.get(
-        "data",
-        []
-    )
-
-    if isinstance(data, list):
-
-        if not data:
-            return None
-
-        return data[0]
-
-    return data
-
-
-# ============================================================
-# CREATE MARKET ORDER
+# CREATE ORDER
 # ============================================================
 
 def create_market_order(
-    instrument,
+    symbol,
     side,
     quantity
 ):
 
     client_oid = (
         "grok-"
-        + uuid.uuid4().hex[:30]
+        + uuid.uuid4().hex[:24]
     )
 
     params = {
-        "instrument_name": instrument,
+        "instrument_name": symbol,
+
         "side": side,
+
         "type": "MARKET",
-        "quantity": decimal_string(
-            quantity
+
+        "quantity": format(
+            quantity,
+            "f"
         ),
+
         "client_oid": client_oid,
-        "spot_margin": "SPOT"
+
+        "spot_margin": "SPOT",
     }
 
-    log(
-        f"ORDER REQUEST: "
-        f"{side} {quantity} {instrument}"
-    )
-
-    result = crypto_private(
+    return private_call(
         "private/create-order",
         params
     )
 
-    order_id = result.get(
-        "order_id"
-    )
-
-    if not order_id:
-        raise RuntimeError(
-            f"No order_id returned: {result}"
-        )
-
-    return {
-        "order_id": str(order_id),
-        "client_oid": client_oid
-    }
-
 
 # ============================================================
-# WAIT FOR ORDER
+# EXECUTION
 # ============================================================
 
-def wait_for_order(
-    order_id
+def execute_trade(
+    decision,
+    account,
+    portfolio,
+    state,
+    market
 ):
 
-    deadline = (
-        time.time()
-        + ORDER_TIMEOUT_SECONDS
+    action = decision["action"]
+
+    symbol = decision["instrument"]
+
+    confidence = float(
+        decision["confidence"]
     )
 
-    last = None
-
-    while time.time() < deadline:
-
-        try:
-
-            last = get_order_detail(
-                order_id=order_id
-            )
-
-            if last:
-
-                status = str(
-                    last.get(
-                        "status",
-                        ""
-                    )
-                ).upper()
-
-                log(
-                    f"ORDER STATUS: "
-                    f"{status}"
-                )
-
-                if status in (
-                    "FILLED",
-                    "REJECTED",
-                    "CANCELED",
-                    "EXPIRED"
-                ):
-
-                    return last
-
-        except Exception as e:
-
-            log(
-                f"Order status error: {e}"
-            )
-
-        time.sleep(
-            ORDER_CHECK_SECONDS
+    size_pct = Decimal(
+        str(
+            decision["size_pct"]
         )
-
-    return last
-
-
-# ============================================================
-# PORTFOLIO VALUE
-# ============================================================
-
-def portfolio_value_usdt(account):
-
-    usdt = available_balance(
-        account,
-        "USDT"
     )
 
-    btc = available_balance(
-        account,
-        "BTC"
+    spread = Decimal(
+        str(
+            market["spread_pct"]
+        )
     )
 
-    eth = available_balance(
-        account,
-        "ETH"
-    )
+    # --------------------------------------------------------
+    # HOLD
+    # --------------------------------------------------------
 
-    btc_value = Decimal("0")
-    eth_value = Decimal("0")
+    if action == "hold":
 
-    if btc > 0:
-
-        btc_ticker = get_ticker(
-            "BTC_USDT"
+        log(
+            f"HOLD {symbol} | "
+            f"confidence={confidence:.2f} | "
+            f"{decision['reason']}"
         )
 
-        btc_value = (
-            btc
-            * btc_ticker["bid"]
+        return
+
+    # --------------------------------------------------------
+    # HARD RISK CHECKS
+    # --------------------------------------------------------
+
+    if confidence < MIN_CONFIDENCE:
+
+        log(
+            "RISK REJECT: "
+            "confidence too low"
         )
 
-    if eth > 0:
+        return
 
-        eth_ticker = get_ticker(
-            "ETH_USDT"
-        )
-
-        eth_value = (
-            eth
-            * eth_ticker["bid"]
-        )
-
-    total = (
-        usdt
-        + btc_value
-        + eth_value
-    )
-
-    return total
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-def default_state():
-
-    return {
-        "day":
-            datetime.now(
-                timezone.utc
-            ).date().isoformat(),
-
-        "day_start_value":
-            None,
-
-        "last_trade_time":
-            None,
-
-        "last_trade_instrument":
-            None,
-
-        "trades_today":
-            0
-    }
-
-
-def load_state():
-
-    if not os.path.exists(
-        ACCOUNT_STATE_FILE
+    if (
+        size_pct <= 0
+        or size_pct > MAX_TRADE_PCT
     ):
 
-        return default_state()
+        log(
+            "RISK REJECT: "
+            "invalid trade size"
+        )
 
-    try:
+        return
 
-        with open(
-            ACCOUNT_STATE_FILE,
-            "r"
-        ) as f:
-
-            state = json.load(f)
-
-        defaults = default_state()
-
-        for key, value in defaults.items():
-
-            if key not in state:
-                state[key] = value
-
-        return state
-
-    except Exception as e:
+    if spread > MAX_SPREAD_PCT:
 
         log(
-            f"Could not load state: {e}"
+            f"RISK REJECT: "
+            f"spread={spread}%"
         )
 
-        return default_state()
+        return
 
-
-def save_state(state):
-
-    temporary = (
-        ACCOUNT_STATE_FILE
-        + ".tmp"
+    last_trade = state.get(
+        "last_trade_time"
     )
 
-    with open(
-        temporary,
-        "w"
-    ) as f:
+    if last_trade:
 
-        json.dump(
-            state,
-            f,
-            indent=2
+        elapsed = (
+            time.time()
+            - float(last_trade)
         )
 
-    os.replace(
-        temporary,
-        ACCOUNT_STATE_FILE
-    )
+        if elapsed < COOLDOWN_SECONDS:
 
+            log(
+                "RISK REJECT: "
+                "trade cooldown active"
+            )
 
-# ============================================================
-# DAILY LOSS PROTECTION
-# ============================================================
+            return
 
-def check_daily_loss(
-    state,
-    current_value
-):
+    # --------------------------------------------------------
+    # OPEN ORDER CHECK
+    # --------------------------------------------------------
 
-    today = (
-        datetime.now(
-            timezone.utc
-        )
-        .date()
-        .isoformat()
-    )
-
-    if state.get("day") != today:
-
-        state["day"] = today
-
-        state["day_start_value"] = str(
-            current_value
-        )
-
-        state["trades_today"] = 0
-
-        state["last_trade_time"] = None
-
-        state["last_trade_instrument"] = None
-
-        save_state(state)
+    if open_orders(symbol):
 
         log(
-            f"New UTC trading day. "
-            f"Starting value: "
-            f"${current_value:.4f}"
+            f"RISK REJECT: "
+            f"open order exists for "
+            f"{symbol}"
         )
 
-        return True
+        return
 
-    if state.get(
-        "day_start_value"
-    ) is None:
+    # --------------------------------------------------------
+    # PRICE
+    # --------------------------------------------------------
 
-        state["day_start_value"] = str(
-            current_value
-        )
+    ticker_data = get_ticker(
+        symbol
+    )
 
-        save_state(state)
+    if action == "buy":
+        price = ticker_data["ask"]
+    else:
+        price = ticker_data["bid"]
+
+    if price <= 0:
 
         log(
-            f"Daily starting value set: "
-            f"${current_value:.4f}"
+            "RISK REJECT: "
+            "invalid market price"
         )
 
-        return True
+        return
 
-    starting_value = Decimal(
-        str(
-            state[
-                "day_start_value"
-            ]
-        )
+    # --------------------------------------------------------
+    # TRADE VALUE
+    # --------------------------------------------------------
+
+    target_value = (
+        portfolio
+        * size_pct
     )
 
-    if starting_value <= 0:
-        return True
-
-    loss_pct = (
-        (starting_value - current_value)
-        / starting_value
-        * 100
-    )
-
-    log(
-        f"Daily P/L: "
-        f"{loss_pct:.2f}%"
-    )
-
-    max_loss_pct = (
-        DAILY_LOSS_LIMIT_PCT
-        * 100
-    )
-
-    if loss_pct >= max_loss_pct:
+    if target_value < MIN_TRADE_USDT:
 
         log(
-            "DAILY LOSS LIMIT REACHED. "
-            "NO NEW TRADES."
+            f"RISK REJECT: "
+            f"trade value ${target_value:.4f} "
+            f"is below ${MIN_TRADE_USDT}"
         )
 
-        return False
+        return
 
-    return True
+    # --------------------------------------------------------
+    # CALCULATE QUANTITY
+    # --------------------------------------------------------
 
+    if action == "buy":
 
-# ============================================================
-# GROK DECISION
-# ============================================================
+        usdt = available(
+            account,
+            "USDT"
+        )
 
-def ask_grok(
-    market_data,
-    account
-):
+        spend = min(
+            target_value,
+            usdt
+        )
 
-    portfolio = {
-        "USDT": str(
-            available_balanc
+        if spend < MIN_TRADE_USDT:
+
+            log(
+                "BUY REJECT: "
+                "insufficient USDT"
+            )
+
+            return
+
+        quantity = (
+            spend / price
+        )
+
+    else:
+
+        if symbol == "BTC_USDT":
+            coin = "BTC"
+        else:
+            coin = "ETH"
+
+        coin_avai
